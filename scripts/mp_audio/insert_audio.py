@@ -34,6 +34,22 @@ from urllib.parse import quote
 # --------------------------------------------------------------------- JS 片段
 # 统一用 __X__ 占位，避免 f-string 与 JS 花括号打架。
 
+JS_ADD_ARTICLE = """(async () => {
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const add = document.querySelector("#js_add_appmsg");
+  if (!add) return "no-add-control";
+  const wrp = document.querySelector(".preview_media_add_wrp");
+  if (wrp && (wrp.className || "").includes("js_readonly")) return "add-readonly";
+  const before = document.querySelectorAll(".ProseMirror").length;
+  add.click();
+  for (let i = 0; i < 20; i++) {
+    await sleep(400);
+    const now = document.querySelectorAll(".ProseMirror").length;
+    if (now >= before + 2) return JSON.stringify({ ok: true, pm: now });
+  }
+  return "add-no-effect";
+})()"""
+
 JS_FILL_ARTICLE = """(() => {
   const pms = document.querySelectorAll(".ProseMirror");
   if (pms.length < 2) return "no-editor";
@@ -278,6 +294,7 @@ class Options:
     cover: str = "avatar"
     cover_file: str | None = None
     existing: bool = False
+    extra_articles: list[tuple[str, str]] | None = None
     article_title: str | None = None
     body_text: str | None = None
     scope: str = "mpaudio"
@@ -380,6 +397,50 @@ class AudioInserter:
                 return obs
             time.sleep(0.5)
         raise BskError("图文编辑器未就绪（未登录 / 改版 / 弹窗遮挡）")
+
+    def add_secondary_article(self, title: str, body: str) -> None:
+        """给同一条图文加一个「次条」，并写入标题与正文。"""
+        res = self._eval(JS_ADD_ARTICLE)
+        if not isinstance(res, dict) or not res.get("ok"):
+            raise BskError(
+                f"无法新增次条：{res}（多图文入口要求账号已实名、且头条已有封面；"
+                "未实名账号上「增加一条」是 js_readonly）"
+            )
+        self._log(f"已新增次条，当前 {res.get('pm')} 个编辑区")
+        paras = [p.strip() for p in (body or "").split("\n") if p.strip()] or [f"{title}（正文占位）。"]
+        js = """(() => {
+  const pms = [...document.querySelectorAll(".ProseMirror")];
+  if (pms.length < 2) return "no-editor";
+  const titleEl = pms[pms.length - 2];
+  const bodyEl = pms[pms.length - 1];
+  const paste = (el, html, text) => {
+    el.focus();
+    const rg = document.createRange();
+    rg.selectNodeContents(el);
+    const sel = getSelection();
+    sel.removeAllRanges();
+    sel.addRange(rg);
+    const dt = new DataTransfer();
+    dt.setData("text/html", html);
+    dt.setData("text/plain", text);
+    return !el.dispatchEvent(
+      new ClipboardEvent("paste", { clipboardData: dt, bubbles: true, cancelable: true })
+    );
+  };
+  paste(titleEl, "<p>" + __TITLE_LIT__ + "</p>", __TITLE_LIT__);
+  const esc = (t) => String(t).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  const html = __BODY_LIT__.map((p) => "<p>" + esc(p) + "</p>").join("");
+  paste(bodyEl, html, __BODY_LIT__.join("\\n"));
+  return JSON.stringify({ title: (titleEl.innerText || "").trim().slice(0, 30), total: pms.length });
+})()"""
+        info = self._eval(
+            self._js(
+                js,
+                TITLE_LIT=json.dumps(title, ensure_ascii=False),
+                BODY_LIT=json.dumps(paras, ensure_ascii=False),
+            )
+        )
+        self._log(f"次条已写入：{info}")
 
     def fill_article(self) -> None:
         """把图文标题与正文写进去（否则保存时会因标题为空被拒）。"""
@@ -586,6 +647,8 @@ class AudioInserter:
                 self.submit_upload()
                 self.wait_transcoded()
             nodes = self.insert_into_article()
+            for extra_title, extra_body in (self.opts.extra_articles or []):
+                self.add_secondary_article(extra_title, extra_body)
             self.save_draft()
             return {"ok": True, "nodes": nodes}
         finally:
@@ -601,6 +664,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--cover-file", default=None, help="音频封面图（≤900x383 最佳），给了就上传封面而不是用头像"
     )
+    parser.add_argument("--extra-article", action="append", default=None, metavar="标题::正文", help="同一条图文里追加次条，可重复（平台上限见文档）")
     parser.add_argument("--existing", action="store_true", help="复用素材库已有音频（跳过上传）")
     parser.add_argument("--article-title", default=None, help="图文标题；不给只插音频不建稿")
     parser.add_argument("--body-text", default=None, help="正文纯文本，换行分段")
@@ -619,6 +683,10 @@ def main(argv: list[str] | None = None) -> int:
         cover=args.cover,
         cover_file=args.cover_file,
         existing=args.existing,
+        extra_articles=[
+            (item.split("::", 1)[0], item.split("::", 1)[1] if "::" in item else "")
+            for item in (args.extra_article or [])
+        ],
         article_title=args.article_title,
         body_text=args.body_text,
         scope=args.scope,
@@ -641,6 +709,9 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(main())
+
+
+
 
 
 
